@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<meta
+			name="viewport"
+			content="width=device-width, initial-scale=1.0"
+		/>
+		<title>Multi-Peer Video Chat</title>
+		<style>
+			video {
+				width: 200px;
+				height: 200px;
+				margin: 10px;
+			}
+		</style>
+	</head>
+	<body>
+		<h1>Multi-Peer Video Chat</h1>
+		<button id="joinButton">Join Room</button>
+		<div id="videos"></div>
+
+		<script src="https://cdn.socket.io/4.6.1/socket.io.min.js"></script>
+
+		<script>
+			const socket = io("http://localhost:3000"); // Connect to signaling server
+			const configuration = {
+				iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+			};
+
+			const localVideo = document.createElement("video");
+			localVideo.autoplay = true;
+			localVideo.muted = true;
+
+			const peerConnections = {};
+			let localStream;
+			const candidateQueue = {}; // Queue for ICE candidates
+
+			// Get user's media (camera and microphone)
+			async function getUserMedia() {
+				localStream = await navigator.mediaDevices.getUserMedia({
+					video: true,
+					audio: true,
+				});
+				localVideo.srcObject = localStream;
+				document.getElementById("videos").appendChild(localVideo);
+			}
+
+			// Join a room
+			document
+				.getElementById("joinButton")
+				.addEventListener("click", async () => {
+					const roomId = "room1"; // Example room ID
+					await getUserMedia(); // Ensure localStream is ready
+					socket.emit("join", roomId);
+				});
+
+			// Handle when a new user connects
+			socket.on("user-connected", async (userId) => {
+				console.log(`User connected: ${userId}`);
+				await createOffer(userId);
+			});
+
+			// Create an offer to a new peer
+			async function createOffer(userId) {
+				const peerConnection = new RTCPeerConnection(configuration);
+				peerConnections[userId] = peerConnection;
+
+				// Add local stream to the connection
+				localStream.getTracks().forEach((track) => {
+					peerConnection.addTrack(track, localStream);
+				});
+
+				// Handle ICE candidates
+				peerConnection.onicecandidate = (event) => {
+					if (event.candidate) {
+						socket.emit("ice-candidate", event.candidate, userId);
+					}
+				};
+
+				// Add remote stream to video
+				peerConnection.ontrack = (event) => {
+					const remoteStream = event.streams[0];
+					const existingVideo = Array.from(
+						document.querySelectorAll("video")
+					).find((video) => video.srcObject === remoteStream);
+
+					if (!existingVideo) {
+						const remoteVideo = document.createElement("video");
+						remoteVideo.srcObject = remoteStream;
+						remoteVideo.autoplay = true;
+						document.getElementById("videos").appendChild(remoteVideo);
+					}
+				};
+
+				// Process buffered ICE candidates
+				if (candidateQueue[userId]) {
+					candidateQueue[userId].forEach((candidate) => {
+						peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+					});
+					delete candidateQueue[userId];
+				}
+
+				// Create and send offer
+				const offer = await peerConnection.createOffer();
+				await peerConnection.setLocalDescription(offer);
+				socket.emit("offer", offer, userId);
+			}
+
+			// Handle incoming offers
+			socket.on("offer", async (offer, from) => {
+				const peerConnection = new RTCPeerConnection(configuration);
+				peerConnections[from] = peerConnection;
+
+				// Add local stream to the connection
+				localStream.getTracks().forEach((track) => {
+					peerConnection.addTrack(track, localStream);
+				});
+
+				// Handle ICE candidates
+				peerConnection.onicecandidate = (event) => {
+					if (event.candidate) {
+						socket.emit("ice-candidate", event.candidate, from);
+					}
+				};
+
+				peerConnection.ontrack = (event) => {
+					const remoteStream = event.streams[0];
+
+					// Check if a video element already exists for this stream
+					const existingVideo = Array.from(
+						document.querySelectorAll("video")
+					).find((video) => video.srcObject === remoteStream);
+
+					// If no video element exists for the stream, create one
+					if (!existingVideo) {
+						const remoteVideo = document.createElement("video");
+						remoteVideo.srcObject = remoteStream;
+						remoteVideo.autoplay = true;
+						document.getElementById("videos").appendChild(remoteVideo);
+					}
+				};
+
+				// Set remote description and process ICE candidates
+				await peerConnection.setRemoteDescription(
+					new RTCSessionDescription(offer)
+				);
+				if (candidateQueue[from]) {
+					candidateQueue[from].forEach((candidate) => {
+						peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+					});
+					delete candidateQueue[from];
+				}
+
+				// Create and send answer
+				const answer = await peerConnection.createAnswer();
+				await peerConnection.setLocalDescription(answer);
+				socket.emit("answer", answer, from);
+			});
+
+			// Handle incoming answers
+			socket.on("answer", async (answer, from) => {
+				const peerConnection = peerConnections[from];
+				await peerConnection.setRemoteDescription(
+					new RTCSessionDescription(answer)
+				);
+			});
+
+			// Handle incoming ICE candidates
+			socket.on("ice-candidate", (candidate, from) => {
+				const peerConnection = peerConnections[from];
+				if (peerConnection?.remoteDescription) {
+					peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+				} else {
+					// Queue the candidate if the connection is not ready
+					if (!candidateQueue[from]) {
+						candidateQueue[from] = [];
+					}
+					candidateQueue[from].push(candidate);
+				}
+			});
+
+			// Handle user disconnecting
+			socket.on("user-disconnected", (userId) => {
+				console.log(`User disconnected: ${userId}`);
+				const peerConnection = peerConnections[userId];
+				if (peerConnection) {
+					peerConnection.close();
+					delete peerConnections[userId];
+				}
+			});
+		</script>
+	</body>
+</html>
